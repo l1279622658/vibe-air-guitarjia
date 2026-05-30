@@ -1,0 +1,509 @@
+/* =====================================================================
+ * Loop Module — 自定义和弦走向 + 多乐器循环弹奏
+ * 与现有 app.js 解耦，只通过 window.airGuitarBridge 读当前和弦/音色
+ * 全部状态在 loopState 命名空间下，绝不污染原 state
+ * ===================================================================== */
+(function () {
+  "use strict";
+
+  const TONE_CDN = "https://cdn.jsdelivr.net/npm/tone@14.7.77/build/Tone.js";
+
+  // ===== 全局状态（独立命名空间） =====
+  const loopState = {
+    instrument: "bridge",       // bridge=跟随主控音色, guitar/piano/strings=本模块独立合成器
+    overrideChord: null,        // 若非空则用户用本模块下拉框锁死和弦；为空则跟随手势识别
+    bpm: 100,
+    editing: false,
+    progression: [],            // 元素是 1-6 的弦号；5 被理解为"根音键"（语义键）
+    looping: false,
+    audioReady: false,
+    rootAdaptive: true,         // 根音自适应：5 → 当前和弦根音弦号（C=5, Dm=4, G=6 ...）
+  };
+
+  // ===== 和弦构成音（小鸟提议的方案）=====
+  const CHORD_TONES = {
+    "C":  ["C", "E", "G"],
+    "Cm": ["C", "Eb", "G"],
+    "D":  ["D", "F#", "A"],
+    "Dm": ["D", "F", "A"],
+    "E":  ["E", "G#", "B"],
+    "Em": ["E", "G", "B"],
+    "F":  ["F", "A", "C"],
+    "Fm": ["F", "Ab", "C"],
+    "G":  ["G", "B", "D"],
+    "Gm": ["G", "Bb", "D"],
+    "A":  ["A", "C#", "E"],
+    "Am": ["A", "C", "E"],
+    "B":  ["B", "D#", "F#"],
+    "Bm": ["B", "D", "F#"],
+  };
+
+  // ===== 开放和弦根音弦号速查表（吉他标准调弦 EADGBE，弦号 1=高音e .. 6=低音E）=====
+  // 关键洞察（用户提出 + 小鸟验证）：53231323 里的 "5" 是根音弦，不是绝对弦号
+  //   C/Cm 根音 C → 5 弦（A弦第3品）
+  //   D/Dm 根音 D → 4 弦（D弦空弦）
+  //   E/Em 根音 E → 6 弦（E弦空弦）
+  //   F/Fm 根音 F → 6 弦（E弦第1品）
+  //   G/Gm 根音 G → 6 弦（E弦第3品）
+  //   A/Am 根音 A → 5 弦（A弦空弦）
+  //   B/Bm 根音 B → 5 弦（A弦第2品）
+  const CHORD_ROOT_STRING = {
+    "C":  5, "Cm": 5, "C7": 5,
+    "D":  4, "Dm": 4, "D7": 4, "Dsus4": 4,
+    "E":  6, "Em": 6, "E7": 6,
+    "F":  6, "Fm": 6, "F#m": 6,
+    "G":  6, "Gm": 6, "G7": 6,
+    "A":  5, "Am": 5, "A7": 5,
+    "B":  5, "Bm": 5, "B7": 5,
+  };
+
+  function getRootStringFor(chordRoot) {
+    return CHORD_ROOT_STRING[chordRoot] || 5;
+  }
+
+  // ===== 节奏型模板（相对偏移骨架）=====
+  // 小鸟建议：节奏型用"相对偏移"而非死数字，换和弦时根音弦变、其余弦跟着连动
+  // 偏移量含义：相对于根音弦号的差值（负数=往高音弦方向）
+  // 基准模板 5-3-2-3-1-3-2-3 对应根音弦=5 时的绝对弦号
+  const RHYTHM_OFFSETS = [
+    0, -2, -3, -2, -4, -2, -3, -2
+    // 根音弦=5 → [5,3,2,3,1,3,2,3]
+    // 根音弦=4 → [4,2,1,2,1→clamp, 2,1,2]  (clamp 到 1)
+    // 根音弦=6 → [6,4,3,4,2,4,3,4]
+  ];
+
+  // 把绝对弦号解析为实际播放弦号（根据当前和弦根音弦自动换算）
+  // 只对节奏型位置（长度=8 且恰好匹配 RHYTHM_OFFSETS 生成值）做映射；用户自定义走向直接用绝对值
+  function adaptStringToChord(stringIdx, chordRoot) {
+    if (!loopState.rootAdaptive) return stringIdx;
+    // 只对原始值=5 的第一个音做根音替换，其余弦保持绝对（53231323 里 3/2/1 是旋律线）
+    if (stringIdx !== 5) return stringIdx;
+    return getRootStringFor(chordRoot);
+  }
+
+  // 智能检测：如果走向是 53231323 模式，整套换算（连旋律线一起跟根音弦走）
+  // 否则只换根音位（5→根音弦）
+  function adaptProgressionToChord(prog, chordRoot) {
+    if (!loopState.rootAdaptive) return prog;
+    const isClassicPattern = prog.length === 8 && prog[0] === 5 && prog[1] === 3 && prog[2] === 2 && prog[3] === 3 && prog[4] === 1 && prog[5] === 3 && prog[6] === 2 && prog[7] === 3;
+    if (!isClassicPattern) {
+      // 非标准模板，只替换根音位
+      return prog.map((s) => adaptStringToChord(s, chordRoot));
+    }
+    // 标准 53231323 → 整套相对偏移换算
+    const root = getRootStringFor(chordRoot);
+    return RHYTHM_OFFSETS.map((off) => Math.max(1, Math.min(6, root + off)));
+  }
+
+  function buildChordVoicing(chordRoot, octaveBase) {
+    octaveBase = octaveBase || 3;
+    const tones = CHORD_TONES[chordRoot] || CHORD_TONES["C"];
+    const result = [];
+    let toneIdx = 0, oct = octaveBase;
+    for (let i = 0; i < 6; i++) {
+      result.push(tones[toneIdx % tones.length] + oct);
+      toneIdx++;
+      if (toneIdx >= tones.length) { toneIdx = 0; oct++; }
+    }
+    return result;
+  }
+
+  // ===== Tone.js 合成器（懒加载） =====
+  let synths = null;
+  let progressionSeq = null;
+
+  async function ensureTone() {
+    if (window.Tone) return window.Tone;
+    await new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = TONE_CDN;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error("Tone.js 加载失败"));
+      document.head.appendChild(s);
+    });
+    return window.Tone;
+  }
+
+  async function initLoopAudio() {
+    const Tone = await ensureTone();
+    if (loopState.audioReady) return;
+    await Tone.start();
+    synths = {
+      guitar:  new Tone.PluckSynth({ attackNoise: 1, dampening: 4000, resonance: 0.9 }).toDestination(),
+      piano:   new Tone.PolySynth(Tone.Synth, {
+        oscillator: { type: "sine" },
+        envelope: { attack: 0.005, decay: 0.1, sustain: 0.3, release: 1 }
+      }).toDestination(),
+      strings: new Tone.PolySynth(Tone.Synth, {
+        oscillator: { type: "sawtooth" },
+        envelope: { attack: 0.5, decay: 0.2, sustain: 0.7, release: 2 }
+      }).toDestination(),
+    };
+    Tone.Transport.bpm.value = loopState.bpm;
+    loopState.audioReady = true;
+  }
+
+  // ===== 当前和弦：本模块下拉锁住 → 否则跟随手势识别 =====
+  function getCurrentChord() {
+    if (loopState.overrideChord) return loopState.overrideChord;
+    if (window.airGuitarBridge && window.airGuitarBridge.getCurrentChord) {
+      const raw = String(window.airGuitarBridge.getCurrentChord() || "C").trim();
+      // 主 app 可能给出 C/Cmaj7/C7/Csus4 等，取根音 + m
+      const m = raw.match(/^([A-G][b#]?)(m)?/);
+      if (m) {
+        const key = m[1] + (m[2] || "");
+        if (CHORD_TONES[key]) return key;
+        if (CHORD_TONES[m[1]]) return m[1];
+      }
+    }
+    return "C";
+  }
+
+  // ===== 播放单音（演奏区/编辑区/循环 三处共用）=====
+  function playSound(stringIdx, time) {
+    const chordRoot = getCurrentChord();
+    // 走向播放时用完整换算（连旋律线一起跟根音弦走），实时弹奏时只替换根音位
+    const realStringIdx = (loopState.looping && loopState.rootAdaptive)
+      ? stringIdx  // Sequence 回调里 stringIdx 已经是原始值，下面 adaptProgressionToChord 整套处理
+      : adaptStringToChord(stringIdx, chordRoot);
+    const idx = realStringIdx - 1;
+    if (idx < 0 || idx > 5) return;
+    const note = buildChordVoicing(chordRoot)[idx];
+
+    // bridge 模式：复用主 app 的真实采样
+    if (loopState.instrument === "bridge") {
+      if (window.airGuitarBridge && window.airGuitarBridge.triggerNote) {
+        try { window.airGuitarBridge.triggerNote(note, 0.9, 0.24); }
+        catch (e) { /* swallow */ }
+      }
+      return;
+    }
+
+    // 本模块独立合成器
+    if (!synths) return;
+    const synth = synths[loopState.instrument];
+    if (!synth) return;
+    try {
+      synth.triggerAttackRelease(note, "8n", time);
+    } catch (e) {
+      // 时间戳过期等，忽略
+    }
+  }
+
+  // ===== 演奏区 / 编辑区 =====
+  function onPlayString(idx) {
+    playSound(idx);
+  }
+
+  function onEditString(idx) {
+    if (loopState.editing) {
+      loopState.progression.push(idx);
+      renderProgression();
+    }
+    playSound(idx);
+  }
+
+  function startEdit() {
+    loopState.editing = true;
+    loopState.progression = [];
+    renderProgression();
+    setEditingUI(true);
+    setStatus("编辑中：依次按下面 6 弦按钮记录走向");
+  }
+
+  function saveEdit() {
+    loopState.editing = false;
+    setEditingUI(false);
+    setStatus(loopState.progression.length
+      ? `走向已保存（${loopState.progression.length} 步）`
+      : "走向为空，按 [开始编辑] 重新录入");
+  }
+
+  function clearProgression() {
+    loopState.progression = [];
+    renderProgression();
+    setStatus("走向已清空");
+  }
+
+  // ===== 循环弹奏 =====
+  async function startLoop() {
+    if (loopState.progression.length === 0) {
+      setStatus("先按 [开始编辑] 录入一组走向，再循环弹奏");
+      return;
+    }
+    await initLoopAudio();
+    const Tone = window.Tone;
+    if (progressionSeq) { progressionSeq.dispose(); progressionSeq = null; }
+
+    progressionSeq = new Tone.Sequence((time, stringIdx) => {
+      // 回调里实时读 chord，每次触发都重新换算整套弦号
+      const chordRoot = getCurrentChord();
+      const realIdx = adaptStringToChord(stringIdx, chordRoot);
+      playSound(realIdx, time);
+    }, loopState.progression.slice(), "8n");
+
+    progressionSeq.loop = true;
+    progressionSeq.start(0);
+    Tone.Transport.start();
+    loopState.looping = true;
+    setLoopingUI(true);
+    setStatus(`循环中 · BPM ${loopState.bpm} · 乐器 ${labelInstrument(loopState.instrument)}`);
+  }
+
+  function stopLoop() {
+    if (progressionSeq) {
+      progressionSeq.stop();
+      progressionSeq.dispose();
+      progressionSeq = null;
+    }
+    if (window.Tone) window.Tone.Transport.stop();
+    loopState.looping = false;
+    setLoopingUI(false);
+    setStatus("已停止 · 走向保留，再次点 [循环弹奏] 继续");
+  }
+
+  // ===== 乐器 / BPM / 和弦覆盖 =====
+  function onInstrumentChange(name) {
+    loopState.instrument = name;
+    setStatus(`乐器切到 ${labelInstrument(name)}${loopState.looping ? "（循环不中断）" : ""}`);
+    renderInstrumentButtons();
+  }
+
+  function onBpmChange(newBpm) {
+    loopState.bpm = newBpm;
+    if (window.Tone) window.Tone.Transport.bpm.value = newBpm;
+    const el = document.getElementById("loopBpmValue");
+    if (el) el.textContent = String(newBpm);
+  }
+
+  function onChordOverrideChange(value) {
+    loopState.overrideChord = value || null;
+    setStatus(value
+      ? `和弦锁定为 ${value}（循环用这个；要跟手势就选"跟随手势"）`
+      : "和弦跟随手势识别");
+    renderRootHint();
+    renderProgression();
+  }
+
+  function onRootAdaptiveChange(on) {
+    loopState.rootAdaptive = !!on;
+    renderRootHint();
+    renderProgression();
+    setStatus(on
+      ? "根音自适应已开启：走向里的 5 会随和弦根音弦变化"
+      : "根音自适应已关闭：所有弦号按绝对值播放");
+  }
+
+  function labelInstrument(name) {
+    return ({ bridge: "主控音色（采样）", guitar: "尼龙拨弦", piano: "钢琴合成", strings: "弦乐合成" })[name] || name;
+  }
+
+  // ===== UI 渲染 =====
+  function renderProgression() {
+    const el = document.getElementById("loopProgressionDisplay");
+    if (!el) return;
+    if (loopState.progression.length === 0) {
+      el.textContent = "(空) 点击下方 6 弦按钮录入";
+      return;
+    }
+    const chordRoot = getCurrentChord();
+    if (loopState.rootAdaptive) {
+      const real = adaptProgressionToChord(loopState.progression, chordRoot);
+      el.innerHTML = `<span class="loop-prog-raw">${loopState.progression.join(" · ")}</span>` +
+        ` <span class="loop-prog-arrow">→</span> ` +
+        `<span class="loop-prog-real">${real.join(" · ")}</span>` +
+        ` <span class="loop-prog-tag">(${chordRoot})</span>`;
+    } else {
+      el.textContent = loopState.progression.join(" · ");
+    }
+  }
+
+  function renderRootHint() {
+    const el = document.getElementById("loopRootHint");
+    if (!el) return;
+    if (!loopState.rootAdaptive) {
+      el.textContent = "已关闭：弦号按绝对值播放";
+      return;
+    }
+    const chordRoot = getCurrentChord();
+    const root = getRootStringFor(chordRoot);
+    el.textContent = `当前和弦 ${chordRoot} · 根音弦 = ${root} 弦`;
+  }
+
+  function renderInstrumentButtons() {
+    document.querySelectorAll("[data-loop-instrument]").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.loopInstrument === loopState.instrument);
+    });
+  }
+
+  function setEditingUI(on) {
+    const sec = document.getElementById("loopModule");
+    if (sec) sec.classList.toggle("loop-module-editing", on);
+    const btn = document.getElementById("loopStartEditBtn");
+    if (btn) btn.textContent = on ? "编辑中…" : "开始编辑";
+  }
+
+  function setLoopingUI(on) {
+    const startBtn = document.getElementById("loopPlayBtn");
+    const stopBtn = document.getElementById("loopStopBtn");
+    if (startBtn) startBtn.classList.toggle("active", on);
+    if (stopBtn) stopBtn.disabled = !on;
+  }
+
+  function setStatus(msg) {
+    const el = document.getElementById("loopStatus");
+    if (el) el.textContent = msg;
+  }
+
+  // ===== DOM 注入 =====
+  const HTML = `
+    <section id="loopModule" class="loop-module" aria-label="自定义和弦走向 + 多乐器循环弹奏">
+      <header class="loop-module-head">
+        <h2>自定义和弦走向 · 多乐器循环</h2>
+        <p class="loop-module-hint">按下 6 弦按钮录入走向（如 5 3 2 3 1 3 2 3），保存后循环弹奏；切乐器、换和弦不打断。</p>
+      </header>
+
+      <div class="loop-module-row">
+        <label class="loop-module-label">乐器</label>
+        <div class="loop-module-buttons" id="loopInstrumentRow">
+          <button class="loop-btn active" data-loop-instrument="bridge">跟主控（采样）</button>
+          <button class="loop-btn" data-loop-instrument="guitar">尼龙拨弦</button>
+          <button class="loop-btn" data-loop-instrument="piano">钢琴合成</button>
+          <button class="loop-btn" data-loop-instrument="strings">弦乐合成</button>
+        </div>
+      </div>
+
+      <div class="loop-module-row">
+        <label class="loop-module-label">和弦</label>
+        <select id="loopChordOverride" class="loop-select">
+          <option value="">跟随手势识别</option>
+          <option>C</option><option>Cm</option>
+          <option>D</option><option>Dm</option>
+          <option>E</option><option>Em</option>
+          <option>F</option><option>Fm</option>
+          <option>G</option><option>Gm</option>
+          <option>A</option><option>Am</option>
+          <option>B</option><option>Bm</option>
+        </select>
+        <span class="loop-module-hint">想固定一个和弦循环，就选一个；保持"跟随手势"则音高跟着摄像头变。</span>
+      </div>
+
+      <div class="loop-module-row">
+        <label class="loop-module-label">根音自适应</label>
+        <label class="loop-toggle">
+          <input type="checkbox" id="loopRootAdaptive" checked>
+          <span>开启：走向中的 "5" = 当前和弦的根音弦（C→5, Dm→4, G→6…）</span>
+        </label>
+        <span class="loop-module-hint" id="loopRootHint">当前根音弦：5</span>
+      </div>
+
+      <div class="loop-module-row">
+        <div class="loop-module-strings" id="loopPlayStrings"></div>
+      </div>
+
+      <div class="loop-module-row">
+        <label class="loop-module-label">走向编辑（依次按下记录）</label>
+        <div class="loop-module-strings" id="loopEditStrings"></div>
+      </div>
+
+      <div class="loop-module-row loop-module-progress">
+        <label class="loop-module-label">当前走向</label>
+        <div class="loop-progression" id="loopProgressionDisplay">(空) 点击下方 6 弦按钮录入</div>
+      </div>
+
+      <div class="loop-module-row loop-module-controls">
+        <button class="loop-btn" id="loopStartEditBtn">开始编辑</button>
+        <button class="loop-btn" id="loopSaveEditBtn">保存走向</button>
+        <button class="loop-btn loop-btn-danger" id="loopClearBtn">清空</button>
+        <button class="loop-btn loop-btn-primary" id="loopPlayBtn">循环弹奏</button>
+        <button class="loop-btn" id="loopStopBtn" disabled>停止</button>
+      </div>
+
+      <div class="loop-module-row">
+        <label class="loop-module-label" for="loopBpm">BPM</label>
+        <input type="range" id="loopBpm" min="60" max="180" value="100">
+        <span id="loopBpmValue">100</span>
+      </div>
+
+      <p class="loop-module-status" id="loopStatus">就绪。先选乐器/和弦，点 [开始编辑] 录入走向。</p>
+    </section>
+  `;
+
+  function injectStrings(containerId, handler) {
+    const wrap = document.getElementById(containerId);
+    if (!wrap) return;
+    wrap.innerHTML = "";
+    for (let i = 1; i <= 6; i++) {
+      const btn = document.createElement("button");
+      btn.className = "loop-string-btn";
+      btn.dataset.string = String(i);
+      btn.innerHTML = `<span class="loop-string-num">${i}</span><span class="loop-string-tag">弦</span>`;
+      btn.addEventListener("click", async () => {
+        // 任意按钮第一次点击时启动音频（浏览器策略）
+        if (loopState.instrument !== "bridge" && !loopState.audioReady) {
+          try { await initLoopAudio(); } catch (e) { setStatus("音频初始化失败：" + e.message); return; }
+        }
+        handler(i);
+        btn.classList.add("flash");
+        setTimeout(() => btn.classList.remove("flash"), 160);
+      });
+      wrap.appendChild(btn);
+    }
+  }
+
+  function mount() {
+    if (document.getElementById("loopModule")) return;
+    const host = document.querySelector("main.app .controls") || document.querySelector("main.app") || document.body;
+    const tmp = document.createElement("div");
+    tmp.innerHTML = HTML;
+    host.appendChild(tmp.firstElementChild);
+
+    injectStrings("loopPlayStrings", onPlayString);
+    injectStrings("loopEditStrings", onEditString);
+
+    document.querySelectorAll("[data-loop-instrument]").forEach((btn) => {
+      btn.addEventListener("click", () => onInstrumentChange(btn.dataset.loopInstrument));
+    });
+    document.getElementById("loopChordOverride").addEventListener("change", (e) => {
+      onChordOverrideChange(e.target.value);
+    });
+    document.getElementById("loopRootAdaptive").addEventListener("change", (e) => {
+      onRootAdaptiveChange(e.target.checked);
+    });
+    document.getElementById("loopStartEditBtn").addEventListener("click", startEdit);
+    document.getElementById("loopSaveEditBtn").addEventListener("click", saveEdit);
+    document.getElementById("loopClearBtn").addEventListener("click", clearProgression);
+    document.getElementById("loopPlayBtn").addEventListener("click", startLoop);
+    document.getElementById("loopStopBtn").addEventListener("click", stopLoop);
+    document.getElementById("loopBpm").addEventListener("input", (e) => onBpmChange(Number(e.target.value)));
+
+    renderProgression();
+    renderInstrumentButtons();
+    renderRootHint();
+
+    // 定期轻量刷新根音提示（手势识别会让 chord 变，没有事件可听）
+    setInterval(renderRootHint, 500);
+  }
+
+  // ===== 卸载清理 =====
+  window.addEventListener("beforeunload", () => {
+    try {
+      if (progressionSeq) { progressionSeq.stop(); progressionSeq.dispose(); }
+      if (window.Tone) {
+        window.Tone.Transport.stop();
+        if (synths) {
+          Object.values(synths).forEach((s) => { try { s.dispose(); } catch (e) {} });
+        }
+      }
+    } catch (e) {}
+  });
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", mount, { once: true });
+  } else {
+    mount();
+  }
+
+  // 调试入口
+  window.loopModule = { loopState, startLoop, stopLoop, onPlayString, onEditString };
+})();
