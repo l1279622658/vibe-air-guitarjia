@@ -1,0 +1,22 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backups
+*.backup
+*.bak
+
+# Large zip files
+*.zip
+
+# Large sample pack folder (extracted)
+4755_SoftNylonGuitarLite_mikegeorgiades_20220306-113100/
+
+# IDE
+.vscode/
+.idea/
+
+# Node
+node_modules/
+.env
+*.log
