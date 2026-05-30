@@ -19,7 +19,7 @@
 
 1. 克隆仓库
    ```bash
-   git clone https://github.com/l1279622658/-v1.git
+   git clone https://github.com/l1279622658/vibe-air-guitarjia.git
    cd vibe-air-guitar
    ```
 
